@@ -3,3 +3,10 @@ pandas
 requests
 python-dateutil
 altair
+numpy
+streamlit-autorefresh
+kalshi-python
+scikit-learn
+python-dotenv
+joblib
+
