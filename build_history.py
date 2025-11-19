@@ -1,45 +1,66 @@
+# build_history.py
+#
+# Pull settled markets from Kalshi PUBLIC API and save to CSV for modeling.
+# No auth, no SDK, no enum drama.
+
 from datetime import datetime, timezone
+import time
+import requests
 import pandas as pd
-from kalshi_client import get_kalshi_client
+
+BASE_URL = "https://api.elections.kalshi.com/trade-api/v2/markets"
 
 DAYS_BACK = 365
-PAGE_LIMIT = 1000
+PAGE_LIMIT = 1000          # max per docs
 MAX_MARKETS = 30000
 OUT_CSV = "kalshi_markets_history.csv"
 
-def fetch_settled_markets(days_back=DAYS_BACK,
-                          page_limit=PAGE_LIMIT,
-                          max_markets=MAX_MARKETS) -> pd.DataFrame:
-    client = get_kalshi_client()
 
+def fetch_settled_markets(
+    days_back: int = DAYS_BACK,
+    page_limit: int = PAGE_LIMIT,
+    max_markets: int = MAX_MARKETS,
+) -> pd.DataFrame:
+    """
+    Uses the public /markets endpoint with ?status=settled and timestamp filters.
+    Avoids kalshi_python SDK so we don't hit the 'finalized' enum bug.
+    """
     now_ts = int(datetime.now(timezone.utc).timestamp())
     min_ts = now_ts - days_back * 24 * 3600
 
-    all_markets = []
-    cursor = None
+    all_markets: list[dict] = []
+    cursor: str | None = None
 
     while True:
-        resp = client.get_markets(
-            limit=page_limit,
-            cursor=cursor,
-            status="settled",
-            min_close_ts=min_ts,
-            max_close_ts=now_ts,
-        )
+        params = {
+            "status": "settled",
+            "limit": page_limit,
+            "min_close_ts": min_ts,
+            "max_close_ts": now_ts,
+        }
+        if cursor:
+            params["cursor"] = cursor
 
-        markets = resp.markets or []
+        resp = requests.get(BASE_URL, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+
+        markets = data.get("markets", [])
         if not markets:
             break
 
-        for m in markets:
-            all_markets.append(m.to_dict())
+        all_markets.extend(markets)
+        cursor = data.get("cursor")
 
-        cursor = resp.cursor
-        print(f"Fetched {len(all_markets)} markets so far "
-              f"(cursor={'<end>' if not cursor else cursor[:10] + '...'})")
+        print(
+            f"Fetched {len(all_markets)} markets so far "
+            f"(cursor={'<end>' if not cursor else cursor[:10] + '...'})"
+        )
 
         if not cursor or len(all_markets) >= max_markets:
             break
+
+        time.sleep(0.2)  # be polite
 
     if not all_markets:
         return pd.DataFrame()
@@ -68,6 +89,7 @@ def fetch_settled_markets(days_back=DAYS_BACK,
     keep_cols = [c for c in keep_cols if c in df.columns]
     df = df[keep_cols]
 
+    # 1 = YES, 0 = NO, NaN = other resolution types
     df["label_yes"] = df["result"].map({"yes": 1, "no": 0})
 
     for col in ["close_time", "expiration_time"]:
@@ -75,6 +97,7 @@ def fetch_settled_markets(days_back=DAYS_BACK,
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
     return df
+
 
 def main():
     print(f"Fetching up to {MAX_MARKETS} settled markets over last {DAYS_BACK} days…")
@@ -86,6 +109,7 @@ def main():
     df.to_csv(OUT_CSV, index=False)
     print(f"Saved {len(df)} rows to {OUT_CSV}")
     print(df.head())
+
 
 if __name__ == "__main__":
     main()
