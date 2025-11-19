@@ -2,20 +2,19 @@
 
 import os
 from datetime import datetime, timezone
-
-import requests
 import pandas as pd
 import numpy as np
+import requests
 import streamlit as st
 import altair as alt
 import joblib
-from streamlit_autorefresh import st_autorefresh  # if you later enable auto-refresh
+from streamlit_autorefresh import st_autorefresh  # only used if AUTOREFRESH_SECONDS > 0
 
 # ------------------------- CONFIG ------------------------- #
 
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 DEFAULT_LIMIT = 500        # default number of markets to fetch
-AUTOREFRESH_SECONDS = 0    # set >0 for auto-refresh
+AUTOREFRESH_SECONDS = 0    # set >0 to enable auto-refresh e.g., 60
 
 # --------------------- DATA FUNCTIONS --------------------- #
 
@@ -43,9 +42,9 @@ def fetch_markets(limit: int = DEFAULT_LIMIT, status: str | None = None) -> pd.D
         "last_price", "volume", "volume_24h",
         "open_interest", "liquidity"
     ]
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for c in numeric_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
     if {"yes_bid", "yes_ask"}.issubset(df.columns):
         df["yes_mid"] = (df["yes_bid"] + df["yes_ask"]) / 2.0
@@ -67,9 +66,6 @@ def fetch_markets(limit: int = DEFAULT_LIMIT, status: str | None = None) -> pd.D
 
 @st.cache_resource
 def load_edge_model():
-    """
-    Load trained logistic regression model from kalshi_edge_model.joblib.
-    """
     try:
         bundle = joblib.load("kalshi_edge_model.joblib")
         return bundle["model"], bundle["feature_cols"]
@@ -90,8 +86,7 @@ def compute_model_probs(df: pd.DataFrame) -> pd.DataFrame:
     if "market_implied_prob_yes" not in df.columns:
         df["market_implied_prob_yes"] = df["yes_mid"] / 100.0
 
-    vol = df["volume"].fillna(0)
-    df["log_volume"] = np.log1p(vol)
+    df["log_volume"] = np.log1p(df["volume"].fillna(0))
 
     for col in ["expected_expiration_time", "expiration_time", "close_time"]:
         if col in df.columns:
@@ -105,11 +100,11 @@ def compute_model_probs(df: pd.DataFrame) -> pd.DataFrame:
 
     now = datetime.now(timezone.utc)
     days = (ref - now).dt.total_seconds() / (3600 * 24)
-    df["days_to_expiration"] = days.clip(lower=-30, upper=365).fillna(0)
+    df["days_to_expiration"] = days.clip(lower=-30, upper=365).fillna(0.0)
 
-    for col in feature_cols:
-        if col not in df.columns:
-            df[col] = 0.0
+    for c in feature_cols:
+        if c not in df.columns:
+            df[c] = 0.0
 
     X_live = df[feature_cols].fillna(0.0).values
     probs = model.predict_proba(X_live)[:, 1]
@@ -119,7 +114,7 @@ def compute_model_probs(df: pd.DataFrame) -> pd.DataFrame:
 
     abs_edge = df["edge_pct"].abs()
     edge_norm = abs_edge / (abs_edge.max() + 1e-9)
-    vol_norm = np.log1p(df["volume"].fillna(0)) / (np.log1p(df["volume"].fillna(0)).max() + 1e-9)
+    vol_norm = df["log_volume"] / (df["log_volume"].max() + 1e-9)
 
     conf_raw = 0.6 * edge_norm + 0.4 * vol_norm
     df["confidence_score"] = (conf_raw * 100).round(1)
@@ -133,7 +128,7 @@ def attach_movers(df: pd.DataFrame, session_col: str = "market_implied_prob_yes"
     df["session_move_abs"] = df["session_move"].abs()
     return df
 
-def kpi_card(label: str, value: str, sub: str):
+def kpi_card(label: str, value: str, sub: str = ""):
     st.metric(label, value, sub)
 
 def prob_hist_chart(df: pd.DataFrame):
@@ -168,7 +163,7 @@ def main():
     st.set_page_config(
         page_title="Kalshi Market Command Center",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="expanded"
     )
 
     st.title("Kalshi Market Command Center")
@@ -179,17 +174,14 @@ def main():
 
     st.sidebar.header("Filters")
     status_filter = st.sidebar.selectbox(
-        "Market status",
-        options=["all", "open", "active", "closed", "settled"],
-        index=0,
+        "Market status", ["all", "open", "active", "closed", "settled"], index=0
     )
     limit = st.sidebar.slider("Max markets", 100, 1000, DEFAULT_LIMIT, step=100)
-    category_filter = st.sidebar.selectbox(
-        "Category",
-        options=["All"] + sorted(list(set(fetch_markets(limit)['category']))),
-        index=0,
-    )
-    search_text = st.sidebar.text_input("Search title / ticker", "")
+    # Preload a small sample to build category list
+    sample = fetch_markets(limit=200, status=status_filter)
+    categories = sorted(sample["category"].dropna().unique().tolist())
+    category_filter = st.sidebar.selectbox("Category", ["All"] + categories, index=0)
+    search_text = st.sidebar.text_input("Search title / ticker")
 
     df = fetch_markets(limit=limit, status=status_filter)
     if category_filter != "All":
@@ -211,21 +203,23 @@ def main():
         ["📊 Overview", "📈 Signals", "🧭 Market Explorer", "🔍 Market Details", "🎯 Signal of the Day"]
     )
 
+    # Overview tab
     with tab_overview:
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Markets (filtered)", f"{len(df):,}", "")
-        open_count = (df["status"] == "open").sum() if "status" in df.columns else 0
-        col2.metric("Open markets", f"{open_count:,}", "")
+        col1.metric("Markets (filtered)", f"{len(df):,}")
+        open_count = df["status"].eq("open").sum() if "status" in df.columns else 0
+        col2.metric("Open markets", f"{open_count:,}")
         avg_prob = df["market_implied_prob_yes"].mean() * 100
-        col3.metric("Avg implied YES", f"{avg_prob:0.1f}%", "")
+        col3.metric("Avg implied YES", f"{avg_prob:0.1f}%")
         total_vol = df["volume"].sum()
-        col4.metric("Total volume", f"{total_vol:,.0f}", "")
+        col4.metric("Total volume", f"{total_vol:,.0f}")
 
         st.subheader("Probability distribution")
         prob_hist_chart(df)
         st.subheader("Volume vs probability")
         volume_vs_prob_chart(df)
 
+    # Signals tab
     with tab_signals:
         st.subheader("Model vs Market Signals")
         min_conf = st.slider("Min confidence", 0.0, 100.0, 60.0, step=5.0)
@@ -236,12 +230,12 @@ def main():
             & (df["edge_pct"].abs() >= min_edge)
         ].copy()
 
-        c_a, c_b, c_c = st.columns(3)
-        c_a.metric("Signals (filtered)", f"{len(sig_df):,}", "")
-        big_disagreements = (df["edge_pct"].abs() >= 10).sum()
-        c_b.metric("Large disagreements (|edge|≥10)", f"{big_disagreements:,}", "")
-        high_conf = (df["confidence_score"] >= 70).sum()
-        c_c.metric("High confidence (≥70)", f"{high_conf:,}", "")
+        ca, cb, cc = st.columns(3)
+        ca.metric("Signals (filtered)", f"{len(sig_df):,}")
+        big_disagreements = df["edge_pct"].abs().ge(10).sum()
+        cb.metric("Large disagreements (|edge|≥10)", f"{big_disagreements:,}")
+        high_conf = df["confidence_score"].ge(70).sum()
+        cc.metric("High confidence (≥70)", f"{high_conf:,}")
 
         st.markdown("#### Top positive edges")
         top_pos = (
@@ -265,6 +259,7 @@ def main():
         )
         st.dataframe(top_neg, use_container_width=True)
 
+    # Explorer tab
     with tab_explorer:
         st.subheader("Market Explorer")
         display_cols = [
@@ -274,27 +269,27 @@ def main():
             "volume", "open_interest", "hours_to_close"
         ]
         display_cols = [c for c in display_cols if c in df.columns]
-
         sorted_df = df.sort_values("edge_pct", ascending=False)
         st.dataframe(sorted_df[display_cols], use_container_width=True, height=600)
 
+    # Details tab
     with tab_details:
         st.subheader("Per-market details")
 
-        search_str = st.text_input("Search ticker or title", "")
-        if search_str:
-            mask = df["ticker"].str.contains(search_str, case=False, na=False) \
-                   | df["title"].str.contains(search_str, case=False, na=False)
-            filtered_df = df[mask]
+        search_input = st.text_input("Search ticker or title", "")
+        if search_input:
+            mask = df["ticker"].str.contains(search_input, case=False, na=False) \
+                   | df["title"].str.contains(search_input, case=False, na=False)
+            filtered = df[mask]
         else:
-            filtered_df = df.copy()
+            filtered = df.copy()
 
-        st.write(f"{len(filtered_df):,} matching markets")
+        st.write(f"{len(filtered):,} matching markets")
 
         choice = st.selectbox(
             "Choose a market",
-            filtered_df["ticker"].tolist(),
-            format_func=lambda x: filtered_df[filtered_df["ticker"] == x]["title"].iloc[0]
+            filtered["ticker"].tolist(),
+            format_func=lambda x: filtered[filtered["ticker"] == x]["title"].iloc[0]
         )
 
         row = df[df["ticker"] == choice].iloc[0]
@@ -304,10 +299,10 @@ def main():
         if "status" in row:
             st.write(f"**Status:** {row['status']}   |   **Close time:** {row.get('close_time','N/A')}")
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Market implied YES", f"{row['market_implied_prob_yes']*100:.1f}%")
-        c2.metric("Model YES", f"{row['model_prob_yes']*100:.1f}%", f"{row['edge_pct']:0.1f} pp edge")
-        c3.metric("Confidence", f"{row['confidence_score']:0.1f}")
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Market implied YES", f"{row['market_implied_prob_yes']*100:.1f}%")
+        d2.metric("Model YES", f"{row['model_prob_yes']*100:.1f}%", f"{row['edge_pct']:0.1f} pp edge")
+        d3.metric("Confidence", f"{row['confidence_score']:0.1f}")
 
         st.markdown("---")
 
@@ -319,26 +314,41 @@ def main():
         with st.expander("Raw data"):
             st.json(row.to_dict())
 
+    # Signal of the Day tab
     with tab_top3:
         st.header("🎯 Top 3 Signals of the Day")
 
-        df_signals = df.copy()
-        df_signals["abs_edge"] = df_signals["edge_pct"].abs()
-        df_signals = df_signals[df_signals["volume"] >= df_signals["volume"].quantile(0.50)]
-        df_signals["score"] = df_signals["confidence_score"] * df_signals["abs_edge"]
-        top3 = df_signals.sort_values("score", ascending=False).head(3)
+        now = datetime.now(timezone.utc)
+        pool = df.copy()
+        if "close_time" in pool.columns:
+            pool = pool[
+                (pool["close_time"] >= now) &
+                (pool["close_time"] <= now + pd.Timedelta(hours=24))
+            ]
 
-        for idx, (_, row) in enumerate(top3.iterrows(), start=1):
-            with st.container():
-                st.subheader(f"Signal #{idx}")
-                st.markdown(f"**{row['title']}**")
-                st.markdown(f"*Ticker:* `{row['ticker']}`  |  *Category:* {row.get('category','N/A')}")
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Market YES", f"{row['market_implied_prob_yes']*100:.1f}%")
-                c2.metric("Model YES", f"{row['model_prob_yes']*100:.1f}%", f"{row['edge_pct']:0.1f} pp edge")
-                c3.metric("Confidence", f"{row['confidence_score']:.1f}")
-                st.write(f"**Volume:** {row['volume']:,}  |  **Edge Magnitude:** {row['abs_edge']:.1f} pp")
-                st.markdown("---")
+        pool["abs_edge"] = pool["edge_pct"].abs()
+        vol_cut = pool["volume"].quantile(0.50)
+        pool = pool[pool["volume"] >= vol_cut]
+        pool["score"] = pool["confidence_score"] * pool["abs_edge"]
+        top3 = pool.sort_values("score", ascending=False).head(3)
+
+        if top3.empty:
+            st.write("No strong signals closing in next 24 hours.")
+        else:
+            for idx, (_, row) in enumerate(top3.iterrows(), start=1):
+                with st.container():
+                    st.subheader(f"Signal #{idx}")
+                    st.markdown(f"**{row['title']}**")
+                    st.markdown(f"*Ticker:* `{row['ticker']}`  |  *Category:* {row.get('category','N/A')}")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Market YES", f"{row['market_implied_prob_yes']*100:.1f}%")
+                    c2.metric("Model YES", f"{row['model_prob_yes']*100:.1f}%", f"{row['edge_pct']:0.1f} pp edge")
+                    c3.metric("Confidence", f"{row['confidence_score']:0.1f}")
+                    st.write(f"**Volume:** {row['volume']:,}  |  **Edge Magnitude:** {row['abs_edge']:.1f} pp")
+                    if "close_time" in row:
+                        hours_left = (row["close_time"] - now).total_seconds() / 3600.0
+                        st.write(f"**Closing in:** {hours_left:.1f} hours")
+                    st.markdown("---")
 
 if __name__ == "__main__":
     main()
