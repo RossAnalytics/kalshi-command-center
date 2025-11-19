@@ -9,13 +9,13 @@ import numpy as np
 import streamlit as st
 import altair as alt
 import joblib
-from streamlit_autorefresh import st_autorefresh  # if you later enable auto refresh
+from streamlit_autorefresh import st_autorefresh  # if you later enable auto-refresh
 
 # ------------------------- CONFIG ------------------------- #
 
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 DEFAULT_LIMIT = 500        # default number of markets to fetch
-AUTOREFRESH_SECONDS = 0    # set >0 for auto refresh
+AUTOREFRESH_SECONDS = 0    # set >0 for auto-refresh
 
 # --------------------- DATA FUNCTIONS --------------------- #
 
@@ -67,6 +67,9 @@ def fetch_markets(limit: int = DEFAULT_LIMIT, status: str | None = None) -> pd.D
 
 @st.cache_resource
 def load_edge_model():
+    """
+    Load trained logistic regression model from kalshi_edge_model.joblib.
+    """
     try:
         bundle = joblib.load("kalshi_edge_model.joblib")
         return bundle["model"], bundle["feature_cols"]
@@ -204,8 +207,8 @@ def main():
     df = compute_model_probs(df)
     df = attach_movers(df)
 
-    tab_overview, tab_signals, tab_explorer, tab_details = st.tabs(
-        ["📊 Overview", "📈 Signals", "🧭 Market Explorer", "🔍 Market Details"]
+    tab_overview, tab_signals, tab_explorer, tab_details, tab_top3 = st.tabs(
+        ["📊 Overview", "📈 Signals", "🧭 Market Explorer", "🔍 Market Details", "🎯 Signal of the Day"]
     )
 
     with tab_overview:
@@ -315,6 +318,27 @@ def main():
 
         with st.expander("Raw data"):
             st.json(row.to_dict())
+
+    with tab_top3:
+        st.header("🎯 Top 3 Signals of the Day")
+
+        df_signals = df.copy()
+        df_signals["abs_edge"] = df_signals["edge_pct"].abs()
+        df_signals = df_signals[df_signals["volume"] >= df_signals["volume"].quantile(0.50)]
+        df_signals["score"] = df_signals["confidence_score"] * df_signals["abs_edge"]
+        top3 = df_signals.sort_values("score", ascending=False).head(3)
+
+        for idx, (_, row) in enumerate(top3.iterrows(), start=1):
+            with st.container():
+                st.subheader(f"Signal #{idx}")
+                st.markdown(f"**{row['title']}**")
+                st.markdown(f"*Ticker:* `{row['ticker']}`  |  *Category:* {row.get('category','N/A')}")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Market YES", f"{row['market_implied_prob_yes']*100:.1f}%")
+                c2.metric("Model YES", f"{row['model_prob_yes']*100:.1f}%", f"{row['edge_pct']:0.1f} pp edge")
+                c3.metric("Confidence", f"{row['confidence_score']:.1f}")
+                st.write(f"**Volume:** {row['volume']:,}  |  **Edge Magnitude:** {row['abs_edge']:.1f} pp")
+                st.markdown("---")
 
 if __name__ == "__main__":
     main()
