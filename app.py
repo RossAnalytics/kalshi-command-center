@@ -223,9 +223,7 @@ def main():
     st.title("Kalshi Market Command Center")
     st.caption("Live probabilities, structure, and model-driven signals across active markets.")
 
-    # Auto-refresh
-    if AUTOREFRESH_SECONDS > 0:
-        st_autorefresh = st.experimental_rerun  # placeholder if you later add streamlit_autorefresh
+   
 
     # Sidebar filters
     st.sidebar.header("Filters")
